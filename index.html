@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="ms">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pusat Pemantauan Pemandu</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+:root{--bg:#0f1115;--card:#1a1d24;--line:#2a2e38;--text:#e8eaed;--muted:#9aa0aa;
+  --ok:#1f7a3a;--warn:#a57a00;--bad:#b32626;--off:#3a3f4a;--accent:#3b82f6}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--card);
+  border-bottom:1px solid var(--line);position:sticky;top:0;z-index:1000;flex-wrap:wrap}
+header h1{font-size:18px;margin:0;flex:1;min-width:200px}
+.pill{padding:4px 10px;border-radius:20px;font-size:13px;background:var(--off)}
+button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:8px 14px;font-size:14px;cursor:pointer}
+button.sec{background:var(--off)}
+button.danger{background:var(--bad)}
+#alertBar{display:none;background:var(--bad);padding:10px 16px;font-weight:600;text-align:center}
+main{padding:16px;display:grid;gap:16px}
+#map{height:260px;border-radius:12px;border:1px solid var(--line)}
+.grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
+.car{background:var(--card);border:2px solid var(--line);border-radius:12px;overflow:hidden;display:flex;flex-direction:column}
+.car.alert{border-color:var(--bad);animation:pulse 1s infinite}
+@keyframes pulse{50%{box-shadow:0 0 0 4px rgba(179,38,38,.35)}}
+.car .top{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;gap:8px}
+.car .name{font-weight:600}
+.video{position:relative;background:#000;aspect-ratio:4/3}
+.video img{width:100%;height:100%;object-fit:contain;display:block}
+.video .msg{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);font-size:14px}
+.rows{padding:10px 12px;display:grid;gap:6px;font-size:14px}
+.row{display:flex;justify-content:space-between;gap:8px}
+.row span:first-child{color:var(--muted)}
+.badge{padding:2px 10px;border-radius:20px;font-size:13px;background:var(--off)}
+.ok{background:var(--ok)}.warn{background:var(--warn)}.bad{background:var(--bad)}
+.actions{display:flex;gap:8px;padding:0 12px 12px}
+.actions button{flex:1;font-size:13px;padding:6px}
+.empty{color:var(--muted);text-align:center;padding:40px}
+dialog{background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:12px;width:min(420px,92vw)}
+dialog label{display:block;font-size:13px;color:var(--muted);margin-top:10px}
+dialog input{width:100%;padding:8px;margin-top:4px;background:#0f1115;color:var(--text);border:1px solid var(--line);border-radius:6px;font-size:15px}
+dialog .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Pusat Pemantauan Pemandu</h1>
+  <span class="pill" id="summary">0 kenderaan</span>
+  <button class="sec" id="soundBtn">Bunyi: OFF</button>
+  <button id="addBtn">+ Tambah kenderaan</button>
+</header>
+<div id="alertBar"></div>
+<main>
+  <div id="map"></div>
+  <div class="grid" id="grid"></div>
+</main>
+
+<dialog id="dlg">
+  <form method="dialog" id="form">
+    <h3 id="dlgTitle" style="margin:0">Tambah kenderaan</h3>
+    <label>Nama (contoh: Lori JKL 1234)<input name="cname" required></label>
+    <label>Alamat dashboard Pi (contoh: http://10.87.90.6:5000 atau https://kereta1.domainawak.com)<input name="curl" required></label>
+    <label>Kunci akses (DMS_KEY di Pi tu)<input name="ckey" type="password" required></label>
+    <div class="btns">
+      <button type="button" class="sec" id="cancelBtn">Batal</button>
+      <button value="save">Simpan</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// ---------- Simpanan senarai kenderaan (dalam browser ni sahaja) ----------
+const STORE = "dms_cars_v1";
+function loadCars(){ try{ return JSON.parse(localStorage.getItem(STORE)) || []; }catch(e){ return []; } }
+function saveCars(){ try{ localStorage.setItem(STORE, JSON.stringify(cars)); }catch(e){} }
+let cars = loadCars();          // [{id,name,url,key,video}]
+const live = {};                // id -> {data, online, lastOk}
+let soundOn = false, editId = null;
+
+// ---------- Peta ----------
+let map = null;
+if(window.L){
+  map = L.map("map").setView([4.2, 101.9], 6);
+  L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+    {maxZoom: 19, attribution: "Tiles &copy; Esri"}).addTo(map);
+} else {
+  document.getElementById("map").innerHTML = '<div class="empty">Peta tak dapat dimuat (tiada internet)</div>';
+}
+const markers = {};
+
+// ---------- Bantuan ----------
+const clean = u => u.trim().replace(/\/+$/, "");
+const q = (car, path) => `${clean(car.url)}${path}?key=${encodeURIComponent(car.key)}`;
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+function render(){
+  const grid = document.getElementById("grid");
+  if(!cars.length){
+    grid.innerHTML = '<div class="empty">Belum ada kenderaan. Tekan "+ Tambah kenderaan".</div>';
+  } else {
+    grid.innerHTML = cars.map(c => `
+      <div class="car" id="car-${c.id}">
+        <div class="top"><span class="name">${esc(c.name)}</span>
+          <span class="badge" id="on-${c.id}">Menyambung...</span></div>
+        <div class="video" id="vid-${c.id}">
+          ${c.video !== false ? `<img src="${q(c,"/video_feed")}" alt="Video ${esc(c.name)}"
+             onerror="this.style.display='none';this.nextElementSibling.style.display='grid'">
+             <div class="msg" style="display:none">Video tak dapat dimuat</div>`
+           : `<div class="msg">Video dimatikan (jimat data)</div>`}
+        </div>
+        <div class="rows">
+          <div class="row"><span>Mengantuk / tertidur</span><span class="badge" id="dr-${c.id}">--</span></div>
+          <div class="row"><span>Main phone</span><span class="badge" id="ph-${c.id}">--</span></div>
+          <div class="row"><span>Alkohol</span><span class="badge" id="al-${c.id}">--</span></div>
+          <div class="row"><span>Kelajuan</span><span id="sp-${c.id}">--</span></div>
+          <div class="row"><span>Lokasi</span><span id="gp-${c.id}">--</span></div>
+        </div>
+        <div class="actions">
+          <button class="sec" onclick="toggleVideo('${c.id}')">${c.video !== false ? "Matikan video" : "Hidupkan video"}</button>
+          <button class="sec" onclick="openFull('${c.id}')">Buka penuh</button>
+          <button class="sec" onclick="editCar('${c.id}')">Edit</button>
+        </div>
+      </div>`).join("");
+  }
+  document.getElementById("summary").textContent = cars.length + " kenderaan";
+  Object.keys(markers).forEach(id => { if(map && !cars.find(c => c.id === id)){ map.removeLayer(markers[id]); delete markers[id]; } });
+}
+
+function setBadge(el, cls, txt){ el.className = "badge " + cls; el.textContent = txt; }
+
+function flagText(v, yes){
+  if(v === null || v === undefined) return ["", "Belum aktif"];
+  if(v) return ["bad", typeof v === "string" ? v : yes];
+  return ["ok", "OK"];
+}
+
+async function poll(car){
+  const st = live[car.id] || (live[car.id] = {});
+  try{
+    const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 5000);
+    const r = await fetch(q(car, "/api/status"), {signal: ctrl.signal, cache: "no-store"});
+    clearTimeout(t);
+    if(r.status === 401){ st.online = "key"; }
+    else { st.data = await r.json(); st.online = true; st.lastOk = Date.now(); }
+  }catch(e){ st.online = false; }
+  update(car);
+}
+
+function update(car){
+  const st = live[car.id] || {}, d = st.data || {};
+  const on = document.getElementById("on-" + car.id);
+  if(!on) return;
+  if(st.online === true) setBadge(on, "ok", "Online");
+  else if(st.online === "key") setBadge(on, "bad", "Kunci salah");
+  else setBadge(on, "", "Offline");
+
+  const fresh = st.online === true;
+  const [dc, dt] = fresh ? flagText(d.drowsy, "MENGANTUK") : ["", "--"];
+  setBadge(document.getElementById("dr-" + car.id), dc, dt);
+  const [pc, pt] = fresh ? flagText(d.phone, "MAIN PHONE") : ["", "--"];
+  setBadge(document.getElementById("ph-" + car.id), pc, pt);
+
+  const a = fresh ? d.alcohol : null;
+  setBadge(document.getElementById("al-" + car.id),
+    a ? (a.status === "BAHAYA" ? "bad" : a.status === "AMARAN" ? "warn" : "ok") : "",
+    a ? a.status : (fresh ? "Tiada sensor" : "--"));
+
+  const g = fresh ? d.gps : null;
+  document.getElementById("sp-" + car.id).textContent = g && g.fix ? g.speed_kmh + " km/j" : "--";
+  document.getElementById("gp-" + car.id).textContent =
+    g ? (g.fix ? g.lat.toFixed(5) + ", " + g.lon.toFixed(5) : "Tiada fix GPS") : (fresh ? "GPS tak disambung" : "--");
+  if(map && g && g.fix){
+    const p = [g.lat, g.lon];
+    if(!markers[car.id]) markers[car.id] = L.marker(p).addTo(map).bindTooltip(car.name);
+    else markers[car.id].setLatLng(p);
+  }
+
+  const danger = fresh && (d.drowsy || d.phone || (a && a.status === "BAHAYA"));
+  document.getElementById("car-" + car.id).classList.toggle("alert", !!danger);
+  st.danger = !!danger;
+  updateAlerts();
+}
+
+let lastBeep = 0;
+function updateAlerts(){
+  const bad = cars.filter(c => live[c.id] && live[c.id].danger);
+  const bar = document.getElementById("alertBar");
+  if(bad.length){
+    bar.style.display = "block";
+    bar.textContent = "AMARAN: " + bad.map(c => {
+      const d = live[c.id].data || {};
+      const why = d.drowsy ? (typeof d.drowsy === "string" ? d.drowsy : "MENGANTUK")
+                : d.phone ? "MAIN PHONE" : "ALKOHOL";
+      return c.name + " (" + why + ")";
+    }).join(", ");
+    if(soundOn && Date.now() - lastBeep > 2000){ beep(); lastBeep = Date.now(); }
+  } else bar.style.display = "none";
+}
+
+let actx = null;
+function beep(){
+  try{
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), gn = actx.createGain();
+    o.frequency.value = 880; o.connect(gn); gn.connect(actx.destination);
+    gn.gain.value = 0.2; o.start(); o.stop(actx.currentTime + 0.4);
+  }catch(e){}
+}
+
+// ---------- Tindakan ----------
+function toggleVideo(id){ const c = cars.find(x => x.id === id); c.video = c.video === false; saveCars(); render(); cars.forEach(update); }
+function openFull(id){ const c = cars.find(x => x.id === id); window.open(q(c, "/"), "_blank"); }
+function editCar(id){
+  editId = id; const c = cars.find(x => x.id === id), f = document.getElementById("form");
+  f.cname.value = c.name; f.curl.value = c.url; f.ckey.value = c.key;
+  document.getElementById("dlgTitle").textContent = "Edit kenderaan";
+  if(!document.getElementById("delBtn")){
+    const b = document.createElement("button"); b.type = "button"; b.id = "delBtn"; b.className = "danger"; b.textContent = "Padam";
+    b.onclick = () => { if(confirm("Padam kenderaan ni?")){ cars = cars.filter(x => x.id !== editId); saveCars(); render(); document.getElementById("dlg").close(); } };
+    document.querySelector(".btns").prepend(b);
+  }
+  document.getElementById("dlg").showModal();
+}
+document.getElementById("addBtn").onclick = () => {
+  editId = null; document.getElementById("form").reset();
+  document.getElementById("dlgTitle").textContent = "Tambah kenderaan";
+  const d = document.getElementById("delBtn"); if(d) d.remove();
+  document.getElementById("dlg").showModal();
+};
+document.getElementById("cancelBtn").onclick = () => document.getElementById("dlg").close();
+document.getElementById("form").onsubmit = e => {
+  const f = e.target, item = {name: f.cname.value.trim(), url: clean(f.curl.value), key: f.ckey.value};
+  if(!/^https?:\/\//.test(item.url)){
+    // Alamat IP / localhost / ada port -> http, domain biasa -> https
+    const local = /^(localhost|\d{1,3}(\.\d{1,3}){3}|[^\/]+\.local)(:\d+)?(\/|$)/.test(item.url) || /:\d+(\/|$)/.test(item.url);
+    item.url = (local ? "http://" : "https://") + item.url;
+  }
+  if(editId){ Object.assign(cars.find(c => c.id === editId), item); }
+  else cars.push({id: "c" + Date.now().toString(36), video: true, ...item});
+  saveCars(); render(); cars.forEach(poll);
+};
+document.getElementById("soundBtn").onclick = e => {
+  soundOn = !soundOn; e.target.textContent = "Bunyi: " + (soundOn ? "ON" : "OFF");
+  if(soundOn) beep();
+};
+
+render();
+cars.forEach(poll);
+setInterval(() => cars.forEach(poll), 2000);
+</script>
+</body>
+</html>
